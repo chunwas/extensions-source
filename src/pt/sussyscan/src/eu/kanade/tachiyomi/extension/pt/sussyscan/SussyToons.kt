@@ -16,42 +16,34 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.getPreferences
-import keiyoushi.utils.parseAs
-import keiyoushi.utils.tryParse
+import eu.kanade.tachiyomi.util.WebViewActivity
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.HttpUrl
+import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
-import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.injectLazy
 import java.io.IOException
 import java.text.SimpleDateFormat
-import java.util.Locale
+import java.util.*
+import java.util.concurrent.TimeUnit
 
 class SussyToons : HttpSource(), ConfigurableSource {
 
     override val name = "Sussy Toons"
-
     override val lang = "pt-BR"
-
     override val supportsLatest = true
-
     override val id = 6963507464339951166
-
-    // Moved from Madara
     override val versionId = 2
 
     private val json: Json by injectLazy()
-
     private val isCi = System.getenv("CI") == "true"
-
     private val preferences: SharedPreferences = getPreferences()
 
+    // Configurações de URL
     private var apiUrl: String
         get() = preferences.getString(API_BASE_URL_PREF, defaultApiUrl)!!
         set(value) = preferences.edit().putString(API_BASE_URL_PREF, value).apply()
@@ -65,43 +57,95 @@ class SussyToons : HttpSource(), ConfigurableSource {
         else -> preferences.getString(BASE_URL_PREF, defaultBaseUrl)!!
     }
 
-    private val defaultBaseUrl: String = "https://www.sussytoons.wtf"
-    private val defaultApiUrl: String = "https://api.sussytoons.wtf"
+    private val defaultBaseUrl = "https://www.sussytoons.wtf"
+    private val defaultApiUrl = "https://api.sussytoons.wtf"
 
+    // Gerenciamento de Cookies e Cliente HTTP
+    private val cookieJar = PersistentCookieJar()
     override val client = network.cloudflareClient.newBuilder()
-        .addInterceptor(::imageLocation)
+        .cookieJar(cookieJar)
+        .addInterceptor(CloudflareInterceptor())
+        .addInterceptor(RetryInterceptor())
         .build()
 
     init {
-        if (restoreDefaultEnable) {
-            restoreDefaultEnable = false
-            preferences.edit().putString(DEFAULT_BASE_URL_PREF, null).apply()
-            preferences.edit().putString(API_DEFAULT_BASE_URL_PREF, null).apply()
-        }
+        if (restoreDefaultEnable) resetDefaultSettings()
+    }
 
-        preferences.getString(DEFAULT_BASE_URL_PREF, null).let { domain ->
-            if (domain != defaultBaseUrl) {
-                preferences.edit()
-                    .putString(BASE_URL_PREF, defaultBaseUrl)
-                    .putString(DEFAULT_BASE_URL_PREF, defaultBaseUrl)
-                    .apply()
-            }
-        }
-        preferences.getString(API_DEFAULT_BASE_URL_PREF, null).let { domain ->
-            if (domain != defaultApiUrl) {
-                preferences.edit()
-                    .putString(API_BASE_URL_PREF, defaultApiUrl)
-                    .putString(API_DEFAULT_BASE_URL_PREF, defaultApiUrl)
-                    .apply()
-            }
+    private fun resetDefaultSettings() {
+        restoreDefaultEnable = false
+        with(preferences.edit()) {
+            putString(DEFAULT_BASE_URL_PREF, null)
+            putString(API_DEFAULT_BASE_URL_PREF, null)
+            apply()
         }
     }
 
-    override fun headersBuilder() = super.headersBuilder()
-        .set("scan-id", "1") // Required header for requests
+    //region [Interceptores Cloudflare]
+    private inner class CloudflareInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val request = chain.request()
+            val response = chain.proceed(request)
 
-    // ============================= Popular ==================================
+            if (isCloudflareChallenge(response)) {
+                response.close()
+                resolveCloudflareChallenge(request.url.toString())
+                return chain.proceed(request.newBuilder().build())
+            }
+            return response
+        }
 
+        private fun isCloudflareChallenge(response: Response): Boolean {
+            return response.code == 503 &&
+                    response.headers["Server"]?.contains("cloudflare") == true &&
+                    response.peekBody(5000).string().contains("challenge-form")
+        }
+
+        private fun resolveCloudflareChallenge(url: String) {
+            var challengeResolved = false
+            WebViewActivity.open(context, url, name,
+                onResult = { success ->
+                    challengeResolved = success
+                    if (!success) throw IOException("Falha na verificação Cloudflare")
+                }
+            )
+            if (!challengeResolved) throw IOException("CAPTCHA não resolvido")
+        }
+    }
+
+    private inner class RetryInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            var response = chain.proceed(chain.request())
+            if (!response.isSuccessful) {
+                response.close()
+                Thread.sleep(2000)
+                response = chain.proceed(chain.request())
+            }
+            return response
+        }
+    }
+
+    private inner class PersistentCookieJar : CookieJar {
+        private val prefs = getPreferences()
+        private val cookieKey = "cloudflare_cookies_${hashCode()}"
+
+        override fun loadForRequest(url: HttpUrl): List<Cookie> {
+            return prefs.getStringSet(cookieKey, emptySet())?.mapNotNull {
+                Cookie.parse(url, it)
+            } ?: emptyList()
+        }
+
+        override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+            prefs.edit().putStringSet(cookieKey,
+                cookies.map { it.toString() }.toSet()
+            ).apply()
+        }
+
+        fun clear() = prefs.edit().remove(cookieKey).apply()
+    }
+    //endregion
+
+    //region [Parsing Básico]
     override fun popularMangaRequest(page: Int) = GET(baseUrl, headers)
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -111,8 +155,6 @@ class SussyToons : HttpSource(), ConfigurableSource {
             ?: emptyList()
         return MangasPage(mangas, false)
     }
-
-    // ============================= Latest ===================================
 
     override fun latestUpdatesRequest(page: Int): Request {
         val url = "$baseUrl/atualizacoes".toHttpUrl().newBuilder()
@@ -129,8 +171,6 @@ class SussyToons : HttpSource(), ConfigurableSource {
         return MangasPage(mangas, dto.latest.hasNextPage())
     }
 
-    // ============================= Search ===================================
-
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val url = "$apiUrl/obras".toHttpUrl().newBuilder()
             .addQueryParameter("obr_nome", query)
@@ -146,15 +186,11 @@ class SussyToons : HttpSource(), ConfigurableSource {
         return MangasPage(dto.toSMangaList(), dto.hasNextPage())
     }
 
-    // ============================= Details ==================================
-
     override fun mangaDetailsParse(response: Response): SManga {
         val json = response.parseScriptToJson()
-            ?: throw IOException("Details do mangá não foi encontrado")
+            ?: throw IOException("Detalhes do mangá não encontrados")
         return json.parseAs<ResultDto<MangaDto>>().results.toSManga()
     }
-
-    // ============================= Chapters =================================
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val json = response.parseScriptToJson() ?: return emptyList()
@@ -169,16 +205,35 @@ class SussyToons : HttpSource(), ConfigurableSource {
             }
         }.sortedByDescending(SChapter::chapter_number)
     }
+    //endregion
 
-    // ============================= Pages ====================================
-
+    //region [Parsing de Páginas]
     private val pageUrlSelector = "img.chakra-image"
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
+        
+        if (hasPlaceholderContent(document)) {
+            throw IOException("Conteúdo bloqueado. Toque para verificar")
+        }
 
-        pageListParse(document).takeIf(List<Page>::isNotEmpty)?.let { return it }
+        return extractRealPages(document).ifEmpty {
+            parseJsonPages(document)
+        }
+    }
 
+    private fun hasPlaceholderContent(doc: Document): Boolean {
+        return doc.selectFirst("img[src*='cdn-cgi'], img[alt~=Cloudflare]") != null ||
+                doc.html().contains("cloudflare")
+    }
+
+    private fun extractRealPages(doc: Document): List<Page> {
+        return doc.select("$pageUrlSelector:not([src*='cdn-cgi'])").mapIndexed { index, element ->
+            Page(index, document.location(), element.absUrl("src"))
+        }
+    }
+
+    private fun parseJsonPages(document: Document): List<Page> {
         val dto = extractScriptData(document)
             .let(::extractJsonContent)
             .let(::parseJsonToChapterPageDto)
@@ -199,11 +254,7 @@ class SussyToons : HttpSource(), ConfigurableSource {
             Page(index, imageUrl = imageUrl.toString())
         }
     }
-    private fun pageListParse(document: Document): List<Page> {
-        return document.select(pageUrlSelector).mapIndexed { index, element ->
-            Page(index, document.location(), element.absUrl("src"))
-        }
-    }
+
     private fun extractScriptData(document: Document): String {
         return document.select("script").map(Element::data)
             .firstOrNull(pageRegex::containsMatchIn)
@@ -226,88 +277,56 @@ class SussyToons : HttpSource(), ConfigurableSource {
     }
 
     override fun imageUrlParse(response: Response): String = ""
+    //endregion
 
-    override fun imageUrlRequest(page: Page): Request {
-        val imageHeaders = headers.newBuilder()
-            .add("Referer", "$baseUrl/")
-            .build()
-        return GET(page.url, imageHeaders)
-    }
-
-    // ============================= Interceptors =================================
-
-    private fun imageLocation(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        val response = chain.proceed(request)
-        if (response.isSuccessful) {
-            return response
-        }
-
-        response.close()
-
-        val url = request.url.newBuilder()
-            .dropPathSegment(4)
-            .build()
-
-        val newRequest = request.newBuilder()
-            .url(url)
-            .build()
-        return chain.proceed(newRequest)
-    }
-
-    // ============================= Settings ====================================
-
+    //region [Configurações]
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val fields = listOf(
-            EditTextPreference(screen.context).apply {
-                key = BASE_URL_PREF
-                title = BASE_URL_PREF_TITLE
-                summary = URL_PREF_SUMMARY
-
-                dialogTitle = BASE_URL_PREF_TITLE
-                dialogMessage = "URL padrão:\n$defaultBaseUrl"
-
-                setDefaultValue(defaultBaseUrl)
-            },
-            EditTextPreference(screen.context).apply {
-                key = API_BASE_URL_PREF
-                title = API_BASE_URL_PREF_TITLE
-                summary = buildString {
-                    append("Se não souber como verificar a URL da API, ")
-                    append("busque suporte no Discord do repositório de extensões.")
-                    appendLine(URL_PREF_SUMMARY)
-                    append("\n⚠ A fonte não oferece suporte para essa extensão.")
-                }
-
-                dialogTitle = BASE_URL_PREF_TITLE
-                dialogMessage = "URL da API padrão:\n$defaultApiUrl"
-
-                setDefaultValue(defaultApiUrl)
-            },
-
-            SwitchPreferenceCompat(screen.context).apply {
-                key = DEFAULT_PREF
-                title = "Redefinir configurações"
-                summary = buildString {
-                    append("Habilite para redefinir as configurações padrões no próximo reinicialização da aplicação.")
-                    appendLine("Você pode limpar os dados da extensão em Configurações > Avançado:")
-                    appendLine("\t - Limpar os cookies")
-                    appendLine("\t - Limpar os dados da WebView")
-                    appendLine("\t - Limpar o banco de dados (Procure a '$name' e remova os dados)")
-                }
-                setDefaultValue(false)
-                setOnPreferenceChangeListener { _, _ ->
-                    Toast.makeText(screen.context, RESTART_APP_MESSAGE, Toast.LENGTH_LONG).show()
-                    true
-                }
-            },
-        )
-
-        fields.forEach(screen::addPreference)
+        listOf(
+            createUrlPreference(BASE_URL_PREF, "URL Base", defaultBaseUrl),
+            createUrlPreference(API_BASE_URL_PREF, "URL da API", defaultApiUrl),
+            createResetPreference(),
+            createCookiePreference()
+        ).forEach(screen::addPreference)
     }
 
-    // ============================= Utilities ====================================
+    private fun createUrlPreference(key: String, title: String, default: String): EditTextPreference {
+        return EditTextPreference(screen.context).apply {
+            this.key = key
+            this.title = title
+            summary = "Clique para editar\nPadrão: $default"
+            dialogTitle = title
+            dialogMessage = "URL padrão:\n$default"
+            setDefaultValue(default)
+        }
+    }
 
+    private fun createResetPreference(): SwitchPreferenceCompat {
+        return SwitchPreferenceCompat(screen.context).apply {
+            key = DEFAULT_PREF
+            title = "Redefinir configurações"
+            summary = "Restaura valores padrão no próximo início"
+            setOnPreferenceChangeListener { _, _ ->
+                Toast.makeText(context, "Reinicie o app para aplicar", Toast.LENGTH_LONG).show()
+                true
+            }
+        }
+    }
+
+    private fun createCookiePreference(): SwitchPreferenceCompat {
+        return SwitchPreferenceCompat(screen.context).apply {
+            key = "clear_cookies"
+            title = "Limpar cookies"
+            summary = "Remove todos os dados de navegação"
+            setOnPreferenceClickListener {
+                cookieJar.clear()
+                Toast.makeText(context, "Cookies limpos!", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }
+    }
+    //endregion
+
+    //region [Utilitários]
     private fun Response.parseScriptToJson(): String? {
         val quickJs = QuickJs.create()
         val document = asJsoup()
@@ -334,14 +353,10 @@ class SussyToons : HttpSource(), ConfigurableSource {
         return this
     }
 
-    /**
-     * Normalizes path segments:
-     * Ex: [ "/a/b/", "/a/b", "a/b/", "a/b" ]
-     * Result: "a/b"
-     */
     private fun String.toPathSegment() = this.trim().split("/")
         .filter(String::isNotEmpty)
         .joinToString("/")
+    //endregion
 
     companion object {
         const val CDN_URL = "https://cdn.sussytoons.site"
@@ -352,20 +367,65 @@ class SussyToons : HttpSource(), ConfigurableSource {
         val DETAILS_CHAPTER_REGEX = """\{\"resultado.+"\}{3}""".toRegex()
         val PAGE_JSON_REGEX = """$POPULAR_JSON_REGEX|$LATEST_JSON_REGEX|$DETAILS_CHAPTER_REGEX""".toRegex()
 
-        private const val URL_PREF_SUMMARY = "Para uso temporário, se a extensão for atualizada, a alteração será perdida."
-
         private const val BASE_URL_PREF = "overrideBaseUrl"
-        private const val BASE_URL_PREF_TITLE = "Editar URL da fonte"
-        private const val DEFAULT_BASE_URL_PREF = "defaultBaseUrl"
-        private const val RESTART_APP_MESSAGE = "Reinicie o aplicativo para aplicar as alterações"
-
         private const val API_BASE_URL_PREF = "overrideApiUrl"
-        private const val API_BASE_URL_PREF_TITLE = "Editar URL da API da fonte"
-        private const val API_DEFAULT_BASE_URL_PREF = "defaultApiUrl"
-
         private const val DEFAULT_PREF = "defaultPref"
+        private const val DEFAULT_BASE_URL_PREF = "defaultBaseUrl"
+        private const val API_DEFAULT_BASE_URL_PREF = "defaultApiUrl"
 
         @SuppressLint("SimpleDateFormat")
         val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.ROOT)
     }
 }
+
+//region [Classes de DTO]
+@Serializable
+data class WrapperDto(
+    val popular: List<MangaDto>? = null,
+    val latest: AtualizacoesWrapper
+)
+
+@Serializable
+data class AtualizacoesWrapper(
+    val obras: List<MangaDto>,
+    val tem_proxima: Boolean
+)
+
+@Serializable
+data class MangaDto(
+    val obr_id: String,
+    val obr_slug: String,
+    val obr_nome: String,
+    val obr_sinopse: String? = null,
+    val obr_status: String,
+    val obr_autor: String? = null,
+    val obr_generos: List<String>,
+    val scanId: String? = null
+)
+
+@Serializable
+data class WrapperChapterDto(val chapters: List<ChapterDto>)
+
+@Serializable
+data class ChapterDto(
+    val cap_id: String,
+    val cap_nome: String,
+    @SerialName("cap_numero") val chapterNumber: Float?,
+    @SerialName("cap_data_atualizacao") val updateAt: String
+)
+
+@Serializable
+data class ChapterPageDto(
+    val manga: MangaScanInfo,
+    val chapterNumber: String,
+    val pages: List<PageData>
+)
+
+@Serializable
+data class MangaScanInfo(val id: String, val scanId: String)
+
+@Serializable
+data class PageData(val src: String) {
+    fun isWordPressContent() = src.contains("wp-content", ignoreCase = true)
+}
+//endregion

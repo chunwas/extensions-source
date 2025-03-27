@@ -1,145 +1,116 @@
 package eu.kanade.tachiyomi.extension.pt.sussyscan
 
-import eu.kanade.tachiyomi.extension.pt.sussyscan.SussyToons.Companion.CDN_URL
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonNames
 import org.jsoup.Jsoup
 
 @Serializable
-class ResultDto<T>(
-    @SerialName("pagina")
-    val currentPage: Int = 0,
-    @SerialName("totalPaginas")
-    val lastPage: Int = 0,
-    @JsonNames("resultado")
-    private val resultados: T,
-) {
-    val results: T get() = resultados
+sealed class ApiResult<out T> {
+    @Serializable
+    data class Paginated<T>(
+        @SerialName("pagina") val currentPage: Int,
+        @SerialName("totalPaginas") val totalPages: Int,
+        @SerialName("resultado") val results: T
+    ) : ApiResult<T>() {
+        val hasNextPage get() = currentPage < totalPages
+    }
 
-    fun hasNextPage() = currentPage < lastPage
-
-    fun toSMangaList() = (results as List<MangaDto>)
-        .filterNot { it.slug.isNullOrBlank() }.map { it.toSManga() }
+    @Serializable
+    data class Wrapper<T>(
+        @SerialName("resultado") val results: T
+    ) : ApiResult<T>()
 }
 
 @Serializable
-class WrapperDto(
-    @SerialName("dataTop")
-    val popular: ResultDto<List<MangaDto>>?,
-    @JsonNames("atualizacoesInicial")
-    private val dataLatest: ResultDto<List<MangaDto>>?,
-
-) {
-    val latest: ResultDto<List<MangaDto>> get() = dataLatest!!
-}
+data class HomeWrapper(
+    @SerialName("dataTop") val popular: ApiResult.Paginated<List<MangaDto>>?,
+    @SerialName("atualizacoesInicial") val latestUpdates: ApiResult.Paginated<List<MangaDto>>
+)
 
 @Serializable
-class MangaDto(
-    @SerialName("obr_id")
-    val id: Int,
-    @SerialName("obr_descricao")
-    val description: String?,
-    @SerialName("obr_imagem")
-    val thumbnail: String?,
-    @SerialName("obr_nome")
-    val name: String,
-    @SerialName("obr_slug")
-    val slug: String?,
-    @SerialName("status")
-    val status: MangaStatus,
-    @SerialName("scan_id")
-    val scanId: Int,
-    @SerialName("tags")
-    val genres: List<Genre>,
+data class MangaDto(
+    @SerialName("obr_id") val id: Int,
+    @SerialName("obr_nome") val title: String,
+    @SerialName("obr_slug") val slug: String?,
+    @SerialName("obr_descricao") val rawDescription: String?,
+    @SerialName("obr_imagem") val thumbnailPath: String?,
+    @SerialName("status") val status: MangaStatus,
+    @SerialName("scan_id") val scanId: Int,
+    @SerialName("tags") val genres: List<GenreDto>
 ) {
-
-    fun toSManga(): SManga {
-        val sManga = SManga.create().apply {
-            title = name
-            thumbnail_url = thumbnail?.let {
-                when {
-                    it.startsWith("http") -> thumbnail
-                    else -> "$CDN_URL/scans/$scanId/obras/${this@MangaDto.id}/$thumbnail"
-                }
-            }
+    fun toSManga(baseUrl: String): SManga {
+        val description = rawDescription?.let { 
+            Jsoup.parseBodyFragment(it).text() 
+        }
+        
+        return SManga.create().apply {
+            url = "/obra/$id/${slug ?: ""}"
+            title = this@MangaDto.title
+            this.description = description
+            thumbnail_url = buildThumbnailUrl()
+            status = status.toSMangaStatus()
+            genre = genres.joinToString(", ") { it.name }
             initialized = true
-            url = "/obra/${this@MangaDto.id}/${this@MangaDto.slug}"
-            genre = genres.joinToString()
         }
+    }
 
-        description?.let { Jsoup.parseBodyFragment(it).let { sManga.description = it.text() } }
-        sManga.status = status.toStatus()
-
-        return sManga
+    private fun buildThumbnailUrl(): String? {
+        return when {
+            thumbnailPath.isNullOrBlank() -> null
+            thumbnailPath.startsWith("http") -> thumbnailPath
+            else -> "$CDN_URL/scans/$scanId/obras/$id/$thumbnailPath"
+        }
     }
 
     @Serializable
-    class Genre(
-        @SerialName("tag_nome")
-        val value: String,
-    ) {
-        override fun toString(): String = value
-    }
+    data class GenreDto(
+        @SerialName("tag_nome") val name: String
+    )
 
     @Serializable
-    class MangaStatus(
-        @SerialName("stt_nome")
-        val value: String?,
+    data class MangaStatus(
+        @SerialName("stt_nome") val name: String?
     ) {
-        fun toStatus(): Int {
-            return when (value?.lowercase()) {
-                "em andamento" -> SManga.ONGOING
-                "completo" -> SManga.COMPLETED
-                "hiato" -> SManga.ON_HIATUS
-                else -> SManga.UNKNOWN
-            }
+        fun toSMangaStatus(): Int = when (name?.lowercase()) {
+            "em andamento" -> SManga.ONGOING
+            "completo" -> SManga.COMPLETED
+            "hiato" -> SManga.ON_HIATUS
+            else -> SManga.UNKNOWN
         }
     }
 }
 
 @Serializable
-class ChapterDto(
-    @SerialName("cap_id")
-    val id: Int,
-    @SerialName("cap_nome")
-    val name: String,
-    @SerialName("cap_numero")
-    val chapterNumber: Float?,
-    @SerialName("cap_lancado_em")
-    val updateAt: String,
+data class ChapterListWrapper(
+    @SerialName("capitulos") val chapters: List<ChapterDto>
 )
 
 @Serializable
-class WrapperChapterDto(
-    @SerialName("capitulos")
-    val chapters: List<ChapterDto>,
+data class ChapterDto(
+    @SerialName("cap_id") val id: Int,
+    @SerialName("cap_nome") val name: String,
+    @SerialName("cap_numero") val number: Float?,
+    @SerialName("cap_lancado_em") val releaseDate: String
 )
 
 @Serializable
-class ChapterPageDto(
-    @SerialName("cap_paginas")
-    val pages: List<PageDto>,
-    @SerialName("obra")
-    val manga: MangaReferenceDto,
-    @SerialName("cap_numero")
-    val chapterNumber: Int,
+data class ChapterPagesWrapper(
+    @SerialName("cap_paginas") val pages: List<PageDto>,
+    @SerialName("obra") val mangaRef: MangaReference,
+    @SerialName("cap_numero") val chapterNumber: Int
 ) {
     @Serializable
-    class MangaReferenceDto(
-        @SerialName("obr_id")
-        val id: Int,
-        @SerialName("scan_id")
-        val scanId: Int,
+    data class MangaReference(
+        @SerialName("obr_id") val id: Int,
+        @SerialName("scan_id") val scanId: Int
     )
 }
 
 @Serializable
-class PageDto(
+data class PageDto(
     val src: String,
-    @SerialName("numero")
-    val number: Int? = null,
+    @SerialName("numero") val position: Int? = null
 ) {
-    fun isWordPressContent(): Boolean = number == null
+    val isWordPressContent get() = position == null
 }
